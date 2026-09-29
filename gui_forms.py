@@ -5,7 +5,7 @@ gui_forms.py — Interface PyQt6 no estilo Midnight Ocean Navy.
 import threading
 from datetime import datetime, timedelta
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QCursor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
@@ -15,8 +15,17 @@ from PyQt6.QtWidgets import (
 
 from categories import TIPOS, FORMAS_PAGAMENTO, get_categorias
 from data_manager import DataManager
-from utils import FONTE_GEO, CORES_PALETA, formatar_moeda, validar_valor
+from utils import FONTE_GEO, CORES_PALETA, formatar_moeda, validar_valor, nome_mes
 from voice_input import escutar_microfone, interpretar_comando_voz
+
+
+class ThreadVoz(QThread):
+    """Thread dedicada em PyQt6 para escutar microfone sem travar a interface."""
+    resultado_signal = pyqtSignal(bool, str)
+
+    def run(self):
+        sucesso, resultado = escutar_microfone(timeout=6)
+        self.resultado_signal.emit(sucesso, resultado)
 
 
 class FormularioRegistro(QWidget):
@@ -340,24 +349,17 @@ class FormularioRegistro(QWidget):
 
     def _ouvir_voz(self):
         self.btn_voz.setEnabled(False)
-        self.btn_voz.setText("🎙️ ouvindo...")
-        self.lbl_feedback.setText("🎙️ fale sua transação no microfone...")
+        self.btn_voz.setText("🎙️ Ouvindo...")
+        self.lbl_feedback.setText("🎙️ Fale sua transação no microfone...")
         self.lbl_feedback.setStyleSheet(f"color: {CORES_PALETA['ciano_brilhante']};")
 
-        t = threading.Thread(target=self._processar_voz_thread, daemon=True)
-        t.start()
+        self.thread_voz = ThreadVoz()
+        self.thread_voz.resultado_signal.connect(self._finalizar_voz)
+        self.thread_voz.start()
 
-    def _processar_voz_thread(self):
-        sucesso, resultado = escutar_microfone(timeout=6)
-        self.metaObject().invokeMethod(
-            self, "_finalizar_voz", Qt.ConnectionType.QueuedConnection
-        )
-        self._voz_temp_resultado = (sucesso, resultado)
-
-    def _finalizar_voz(self):
-        sucesso, resultado = getattr(self, "_voz_temp_resultado", (False, "Erro"))
+    def _finalizar_voz(self, sucesso: bool, resultado: str):
         self.btn_voz.setEnabled(True)
-        self.btn_voz.setText("  🎤 preencher por voz  ")
+        self.btn_voz.setText("  🎤 Preencher por Voz  ")
 
         if not sucesso:
             self.lbl_feedback.setText(f"⚠️ {resultado}")
@@ -382,7 +384,8 @@ class FormularioRegistro(QWidget):
         if dados["forma_pagamento"]:
             self.cmb_pag.setCurrentText(dados["forma_pagamento"])
 
-        self.lbl_feedback.setText(f"🗣️ entendido: \"{resultado}\"")
+        val_fmt = formatar_moeda(dados['valor']) if dados['valor'] else ""
+        self.lbl_feedback.setText(f"🗣️ Entendido: \"{dados['descricao']}\" {val_fmt}".strip())
         self.lbl_feedback.setStyleSheet(f"color: {CORES_PALETA['verde_esmeralda']};")
 
     def _dia_anterior(self):
@@ -571,48 +574,98 @@ class TabelaTransacoes(QWidget):
         df = self.dm.obter_transacoes(mes=mes, ano=ano, tipo=tipo)
 
         self.tabela.setRowCount(0)
-        total_entradas = 0.0
-        total_saidas = 0.0
+        self.tabela.clearSpans()
 
-        for row_idx, row in df.iterrows():
-            self.tabela.insertRow(row_idx)
-            valor = float(row["Valor"])
-            tipo_row = str(row["Tipo"])
+        if df.empty:
+            self.lbl_resumo.setText("<span style='color: #94a3b8;'>Nenhuma transação encontrada no período.</span>")
+            return
 
-            if tipo_row == "Entrada":
-                total_entradas += valor
-            else:
-                total_saidas += valor
+        # Converte Data para datetime temporário para ordenação por mês/ano decrescente
+        df_sorted = df.copy()
+        df_sorted["_dt_temp"] = df_sorted["Data"].apply(
+            lambda d: datetime.strptime(str(d), "%d/%m/%Y") if isinstance(d, str) else datetime.now()
+        )
+        df_sorted = df_sorted.sort_values(by="_dt_temp", ascending=False)
 
-            item_data = QTableWidgetItem(str(row["Data"]))
-            item_tipo = QTableWidgetItem(tipo_row)
-            item_cat = QTableWidgetItem(str(row["Categoria"]))
-            item_desc = QTableWidgetItem(str(row["Descrição"]))
-            item_val = QTableWidgetItem(formatar_moeda(valor))
-            item_pag = QTableWidgetItem(str(row["Forma of Pagamento"] if "Forma of Pagamento" in row else row["Forma de Pagamento"]))
+        # Agrupa transações mantendo a ordem decrescente e os índices originais do DataFrame
+        grupos_mes = {}
+        for original_idx, row in df_sorted.iterrows():
+            dt = row["_dt_temp"]
+            chave = (dt.year, dt.month)
+            if chave not in grupos_mes:
+                grupos_mes[chave] = []
+            grupos_mes[chave].append((original_idx, row))
 
-            item_data.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_tipo.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_cat.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_val.setTextAlignment(Qt.AlignmentFlag.AlignRight)
-            item_pag.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        total_entradas_geral = 0.0
+        total_saidas_geral = 0.0
+        row_counter = 0
 
-            for item in [item_data, item_tipo, item_cat, item_desc, item_val, item_pag]:
-                item.setFont(QFont(FONTE_GEO, 10))
+        for (ano_grp, mes_grp), items in grupos_mes.items():
+            ent_mes = sum(float(r["Valor"]) for _, r in items if str(r["Tipo"]) == "Entrada")
+            sai_mes = sum(float(r["Valor"]) for _, r in items if str(r["Tipo"]) != "Entrada")
+            total_entradas_geral += ent_mes
+            total_saidas_geral += sai_mes
 
-            self.tabela.setItem(row_idx, 0, item_data)
-            self.tabela.setItem(row_idx, 1, item_tipo)
-            self.tabela.setItem(row_idx, 2, item_cat)
-            self.tabela.setItem(row_idx, 3, item_desc)
-            self.tabela.setItem(row_idx, 4, item_val)
-            self.tabela.setItem(row_idx, 5, item_pag)
+            nome_m = nome_mes(mes_grp)
 
-        saldo = total_entradas - total_saidas
-        cor_saldo = CORES_PALETA['verde_esmeralda'] if saldo >= 0 else CORES_PALETA['rosa_coral']
+            # Insere linha divisória do mês
+            self.tabela.insertRow(row_counter)
+            self.tabela.setSpan(row_counter, 0, 1, 6)
+
+            header_text = (
+                f"  🗓️  {nome_m.upper()} {ano_grp}  •  "
+                f"{len(items)} transações  |  "
+                f"Entradas: {formatar_moeda(ent_mes)}  |  "
+                f"Saídas: {formatar_moeda(sai_mes)}  |  "
+                f"Saldo do Mês: {formatar_moeda(ent_mes - sai_mes)}"
+            )
+            item_header = QTableWidgetItem(header_text)
+            item_header.setFont(QFont(FONTE_GEO, 10, QFont.Weight.Bold))
+            item_header.setData(Qt.ItemDataRole.UserRole, "MONTH_HEADER")
+            item_header.setFlags(Qt.ItemFlag.ItemIsEnabled)
+
+            self.tabela.setItem(row_counter, 0, item_header)
+            row_counter += 1
+
+            # Insere transações pertencentes a este mês
+            for original_idx, row in items:
+                self.tabela.insertRow(row_counter)
+                valor = float(row["Valor"])
+                tipo_row = str(row["Tipo"])
+
+                item_data = QTableWidgetItem(str(row["Data"]))
+                item_tipo = QTableWidgetItem(tipo_row)
+                item_cat = QTableWidgetItem(str(row["Categoria"]))
+                item_desc = QTableWidgetItem(str(row["Descrição"]))
+                item_val = QTableWidgetItem(formatar_moeda(valor))
+                item_pag = QTableWidgetItem(str(row.get("Forma de Pagamento", row.get("Forma of Pagamento", "Pix"))))
+
+                item_data.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_tipo.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_cat.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_val.setTextAlignment(Qt.AlignmentFlag.AlignRight)
+                item_pag.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                # Armazena o índice real do DataFrame no item
+                item_data.setData(Qt.ItemDataRole.UserRole + 1, original_idx)
+
+                for item in [item_data, item_tipo, item_cat, item_desc, item_val, item_pag]:
+                    item.setFont(QFont(FONTE_GEO, 10))
+
+                self.tabela.setItem(row_counter, 0, item_data)
+                self.tabela.setItem(row_counter, 1, item_tipo)
+                self.tabela.setItem(row_counter, 2, item_cat)
+                self.tabela.setItem(row_counter, 3, item_desc)
+                self.tabela.setItem(row_counter, 4, item_val)
+                self.tabela.setItem(row_counter, 5, item_pag)
+                row_counter += 1
+
+        saldo_geral = total_entradas_geral - total_saidas_geral
+        cor_saldo = CORES_PALETA['verde_esmeralda'] if saldo_geral >= 0 else CORES_PALETA['rosa_coral']
         self.lbl_resumo.setText(
-            f"<span style='color: {CORES_PALETA['verde_esmeralda']};'>Entradas: <b>{formatar_moeda(total_entradas)}</b></span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"<span style='color: {CORES_PALETA['rosa_coral']};'>Saídas: <b>{formatar_moeda(total_saidas)}</b></span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"<span style='color: {cor_saldo};'>Saldo: <b>{formatar_moeda(saldo)}</b></span>"
+            f"<span style='color: {CORES_PALETA['verde_esmeralda']};'>Entradas: <b>{formatar_moeda(total_entradas_geral)}</b></span> &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"<span style='color: {CORES_PALETA['rosa_coral']};'>Saídas: <b>{formatar_moeda(total_saidas_geral)}</b></span> &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"<span style='color: {cor_saldo};'>Saldo Geral: <b>{formatar_moeda(saldo_geral)}</b></span>"
         )
 
     def _editar(self):
@@ -621,6 +674,12 @@ class TabelaTransacoes(QWidget):
             QMessageBox.information(self, "Selecione", "Selecione uma transação para editar.")
             return
 
+        item_zero = self.tabela.item(row, 0)
+        if not item_zero or item_zero.data(Qt.ItemDataRole.UserRole) == "MONTH_HEADER":
+            QMessageBox.information(self, "Aviso", "Selecione uma linha de transação válida (não o cabeçalho do mês).")
+            return
+
+        real_index = item_zero.data(Qt.ItemDataRole.UserRole + 1)
         data_val = self.tabela.item(row, 0).text()
         tipo_val = self.tabela.item(row, 1).text()
         cat_val = self.tabela.item(row, 2).text()
@@ -674,7 +733,7 @@ class TabelaTransacoes(QWidget):
             if v is None:
                 QMessageBox.warning(dlg, "Erro", "Valor inválido.")
                 return
-            self.dm.editar(row, txt_d.text(), cmb_t.currentText(), cmb_c.currentText(), txt_desc.text(), v, cmb_p.currentText())
+            self.dm.editar(real_index, txt_d.text(), cmb_t.currentText(), cmb_c.currentText(), txt_desc.text(), v, cmb_p.currentText())
             dlg.close()
             self.atualizar()
 
@@ -689,6 +748,12 @@ class TabelaTransacoes(QWidget):
             QMessageBox.information(self, "Selecione", "Selecione uma transação para excluir.")
             return
 
+        item_zero = self.tabela.item(row, 0)
+        if not item_zero or item_zero.data(Qt.ItemDataRole.UserRole) == "MONTH_HEADER":
+            QMessageBox.information(self, "Aviso", "Selecione uma linha de transação válida (não o cabeçalho do mês).")
+            return
+
+        real_index = item_zero.data(Qt.ItemDataRole.UserRole + 1)
         desc = self.tabela.item(row, 3).text()
         val = self.tabela.item(row, 4).text()
 
@@ -699,5 +764,5 @@ class TabelaTransacoes(QWidget):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            self.dm.excluir(row)
+            self.dm.excluir(real_index)
             self.atualizar()
